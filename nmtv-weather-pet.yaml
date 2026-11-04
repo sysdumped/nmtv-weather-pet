@@ -1,0 +1,550 @@
+# =====================================================================
+#  NM-TV-154 Weather Pet - ESPHome - stile "occhi robot"
+#  Hardware: NMMiner NM-TV-154 (ESP32-D0WD-V3, ST7789 240x240 SPI)
+#  Umore guidato da meteo + temperatura esterna presi da Home Assistant.
+#  Bagliore, riflesso, transizioni elastiche, squash&stretch,
+#  reazioni brevi (sorpresa, sbadiglio, occhiolino, sospettoso, risveglio)
+# =====================================================================
+
+substitutions:
+  # >>> ADATTA AI TUOI ENTITY ID <<<
+  weather_entity: weather.home
+  temp_entity: sensor.outdoor_temperature
+  touch_pin: GPIO4            # da verificare (vedi note in fondo)
+
+esphome:
+  name: nmtv-pet
+  friendly_name: NM-TV Pet
+  on_boot:
+    - priority: 800
+      then:
+        - switch.turn_on: lcd_power
+    - priority: -100
+      then:
+        - script.execute: calcola_umore
+
+esp32:
+  board: esp32dev
+  flash_size: 4MB
+  framework:
+    type: esp-idf
+
+logger:
+
+api:
+  encryption:
+    key: !secret pet_api_key
+  # Richiamabile da HA come azione "esphome.nmtv_pet_reazione"
+  # tipo: sorpresa | sbadiglio | occhiolino | sospettoso | risveglio
+  actions:
+    - action: reazione
+      variables:
+        tipo: string
+      then:
+        - lambda: |-
+            static const char *const N[] = {"sorpresa", "sbadiglio", "occhiolino",
+                                            "sospettoso", "risveglio"};
+            for (int i = 0; i < 5; i++) {
+              if (tipo == N[i]) {
+                id(react) = i;
+                id(react_start) = millis();
+                id(react_until) = 0;
+              }
+            }
+
+ota:
+  - platform: esphome
+    password: !secret pet_ota_password
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+# ---------------------------------------------------------------------
+#  Stato interno
+# ---------------------------------------------------------------------
+globals:
+  # 0 felice | 1 annoiato | 2 triste | 3 spaventato
+  # 4 infreddolito | 5 accaldato | 6 assonnato | 7 coccolato
+  - id: mood
+    type: int
+    initial_value: '1'
+  - id: eff_mood
+    type: int
+    initial_value: '1'
+  - id: petted_until
+    type: uint32_t
+    initial_value: '0'
+  # Parametri animati:
+  # [0]larghezza [1]altezza [2]palpebra sup [3]inclinazione [4]palpebra inf
+  # [5..7]colore RGB [8]sguardo X [9]sguardo Y
+  # [10]scala occhio sx [11]scala occhio dx [12]stretch da movimento
+  - id: st
+    type: std::vector<float>
+    initial_value: '{74, 70, 0.48, 0, 0, 0, 180, 220, 0, 0, 1, 1, 0}'
+  - id: vel                  # velocità per le molle (parametri 0..4)
+    type: std::vector<float>
+    initial_value: '{0, 0, 0, 0, 0}'
+  - id: look_tx
+    type: float
+    initial_value: '0'
+  - id: look_ty
+    type: float
+    initial_value: '0'
+  - id: next_look
+    type: uint32_t
+    initial_value: '0'
+  # Reazioni: -1 nessuna | 0 sorpresa | 1 sbadiglio | 2 occhiolino
+  #           3 sospettoso | 4 risveglio
+  - id: react
+    type: int
+    initial_value: '-1'
+  - id: react_start
+    type: uint32_t
+    initial_value: '0'
+  - id: react_until          # 0 = appena richiesta, la durata la fissa l'animatore
+    type: uint32_t
+    initial_value: '0'
+  - id: next_react
+    type: uint32_t
+    initial_value: '20000'
+  - id: last_meteo
+    type: std::string
+    initial_value: '""'
+
+# ---------------------------------------------------------------------
+#  Dati da Home Assistant
+# ---------------------------------------------------------------------
+text_sensor:
+  - platform: homeassistant
+    id: meteo
+    entity_id: ${weather_entity}
+    on_value:
+      - lambda: |-
+          // il meteo cambia -> sorpresa (non se dorme)
+          if (!id(last_meteo).empty() && id(last_meteo) != x && id(eff_mood) != 6) {
+            id(react) = 0;
+            id(react_start) = millis();
+            id(react_until) = 0;
+          }
+          id(last_meteo) = x;
+      - script.execute: calcola_umore
+
+sensor:
+  - platform: homeassistant
+    id: temp_ext
+    entity_id: ${temp_entity}
+    on_value:
+      - script.execute: calcola_umore
+
+script:
+  - id: calcola_umore
+    then:
+      - lambda: |-
+          std::string w = id(meteo).has_state() ? id(meteo).state : "";
+          float t = id(temp_ext).state;
+          int m = 1;
+          if (w == "sunny" || w == "partlycloudy")                       m = 0;
+          else if (w == "clear-night")                                   m = 6;
+          else if (w == "rainy" || w == "pouring")                       m = 2;
+          else if (w == "lightning" || w == "lightning-rainy" ||
+                   w == "exceptional" || w == "windy-variant")           m = 3;
+          else if (w == "snowy" || w == "snowy-rainy" || w == "hail")    m = 4;
+          else                                                           m = 1;
+          if (!isnan(t)) {
+            if (t <= 3.0f)  m = 4;
+            if (t >= 30.0f) m = 5;
+          }
+          id(mood) = m;
+
+select:
+  - platform: template
+    id: mood_override
+    name: "Umore"
+    optimistic: true
+    initial_option: "Auto"
+    options:
+      - "Auto"
+      - "Felice"
+      - "Annoiato"
+      - "Triste"
+      - "Spaventato"
+      - "Infreddolito"
+      - "Accaldato"
+      - "Assonnato"
+      - "Coccolato"
+
+# ---------------------------------------------------------------------
+#  Hardware
+# ---------------------------------------------------------------------
+switch:
+  - platform: gpio
+    id: lcd_power
+    pin: GPIO21
+    inverted: true
+    restore_mode: ALWAYS_ON
+    internal: true
+
+binary_sensor:
+  - platform: gpio
+    id: btn_touch
+    name: "Coccola"
+    pin:
+      number: ${touch_pin}
+      inverted: false
+    filters:
+      - delayed_on: 30ms
+    on_press:
+      - lambda: |-
+          id(petted_until) = millis() + 5000;
+
+output:
+  - platform: ledc
+    id: bl_pwm
+    pin: GPIO19
+    inverted: true
+    frequency: 2000
+
+light:
+  - platform: monochromatic
+    output: bl_pwm
+    name: Retroilluminazione
+    restore_mode: ALWAYS_ON
+    default_transition_length: 0s
+
+spi:
+  clk_pin: GPIO14
+  mosi_pin: GPIO13
+
+font:
+  - file: "gfonts://Roboto@500"
+    id: font_info
+    size: 15
+  - file: "gfonts://Roboto@700"
+    id: font_zz
+    size: 24
+
+# ---------------------------------------------------------------------
+#  Motore di animazione (~30 fps)
+# ---------------------------------------------------------------------
+interval:
+  - interval: 33ms
+    then:
+      - lambda: |-
+          uint32_t now = millis();
+          int m = id(mood);
+          auto idx = id(mood_override).active_index();
+          if (idx.has_value() && *idx > 0) m = (int) *idx - 1;
+          bool petted = now < id(petted_until);
+          if (petted) m = 7;
+          id(eff_mood) = m;
+
+          //            W    H    lid   tilt  bottom   R    G    B
+          static const float T[8][8] = {
+            {72, 78, 0.00f, 0.00f, 0.38f,   0, 220, 255},  // felice
+            {74, 70, 0.48f, 0.00f, 0.00f,   0, 180, 220},  // annoiato
+            {66, 72, 0.20f, 0.90f, 0.00f,  70, 120, 255},  // triste
+            {54, 90, 0.00f, 0.00f, 0.00f, 190, 120, 255},  // spaventato
+            {74, 34, 0.00f, 0.00f, 0.00f, 170, 230, 255},  // infreddolito
+            {74, 60, 0.38f, 0.35f, 0.00f, 255, 140,  40},  // accaldato
+            {76,  8, 0.00f, 0.00f, 0.00f,   0,  90, 120},  // assonnato
+            {76, 80, 0.00f, 0.00f, 0.52f, 255, 110, 190},  // coccolato
+          };
+          //  sorpresa sbadiglio occhiolino sospettoso risveglio
+          static const uint32_t DUR[5] = {1600, 2400, 900, 2800, 2200};
+
+          float tgt[8];
+          for (int i = 0; i < 8; i++) tgt[i] = T[m][i];
+          float scaleL = 1.0f, scaleR = 1.0f;
+
+          // ---------- reazioni ----------
+          int r = id(react);
+          if (petted && r >= 0) { r = -1; id(react) = -1; }
+          if (r >= 0 && id(react_until) == 0) id(react_until) = id(react_start) + DUR[r];
+          if (r >= 0 && now > id(react_until)) {
+            r = -1;
+            id(react) = -1;
+            id(next_react) = now + 25000 + random_uint32() % 45000;
+          }
+          if (r < 0 && now > id(next_react) && !petted) {
+            int pick = -1;
+            bool coin = random_uint32() % 2;
+            switch (m) {
+              case 0: pick = coin ? 2 : 3; break;          // occhiolino / sospettoso
+              case 1: pick = coin ? 1 : 3; break;          // sbadiglio / sospettoso
+              case 2: case 4: pick = 3; break;
+              case 5: pick = 1; break;
+              case 6: pick = 4; break;                     // si sveglia un attimo
+              default: break;
+            }
+            if (pick >= 0) {
+              r = pick;
+              id(react) = pick;
+              id(react_start) = now;
+              id(react_until) = now + DUR[pick];
+            } else {
+              id(next_react) = now + 30000;
+            }
+          }
+
+          float p = 0;
+          if (r >= 0) {
+            p = (now - id(react_start)) / (float) DUR[r];
+            switch (r) {
+              case 0:  // sorpresa: occhi grandi e chiari
+                tgt[0] = 62; tgt[1] = 98; tgt[2] = 0; tgt[3] = 0; tgt[4] = 0;
+                tgt[5] = 230; tgt[6] = 245; tgt[7] = 255;
+                break;
+              case 1:  // sbadiglio: si strizzano larghi, poi riaprono
+                if (p < 0.75f) { tgt[0] = 88; tgt[1] = 10; tgt[2] = 0; tgt[3] = -0.5f; tgt[4] = 0; }
+                break;
+              case 2:  // occhiolino
+                scaleR = 0.06f;
+                tgt[4] = 0.35f;
+                break;
+              case 3:  // sospettoso: occhi stretti, sguardo a destra e sinistra
+                tgt[1] = 40; tgt[2] = 0.15f; tgt[3] = -0.45f; tgt[4] = 0;
+                break;
+              case 4:  // risveglio: apre a metà, si guarda attorno, si riaddormenta
+                if (p > 0.15f && p < 0.8f) {
+                  tgt[0] = 70; tgt[1] = 44; tgt[2] = 0.25f; tgt[3] = 0.2f; tgt[4] = 0;
+                }
+                break;
+            }
+          }
+
+          // ---------- molle per la forma (piccolo rimbalzo) ----------
+          auto &s = id(st);
+          auto &v = id(vel);
+          const float K = 0.16f, D = 0.70f;
+          for (int i = 0; i < 5; i++) {
+            v[i] += (tgt[i] - s[i]) * K;
+            v[i] *= D;
+            s[i] += v[i];
+          }
+          if (s[1] < 3) s[1] = 3;
+          if (s[2] < 0) s[2] = 0;
+          if (s[4] < 0) s[4] = 0;
+          for (int i = 5; i < 8; i++) s[i] += (tgt[i] - s[i]) * 0.15f;
+          s[10] += (scaleL - s[10]) * 0.4f;
+          s[11] += (scaleR - s[11]) * 0.4f;
+
+          // ---------- sguardo ----------
+          if (now > id(next_look)) {
+            float range = (m == 1) ? 26.0f : (m == 3 ? 10.0f : 18.0f);
+            float rx = (random_uint32() % 1000) / 500.0f - 1.0f;
+            float ry = (random_uint32() % 1000) / 500.0f - 1.0f;
+            id(look_tx) = rx * range;
+            id(look_ty) = ry * range * 0.4f;
+            if (random_uint32() % 3 == 0 || m == 6 || m == 7) {
+              id(look_tx) = 0; id(look_ty) = 0;
+            }
+            uint32_t base = (m == 1) ? 2500 : (m == 3 ? 350 : 1400);
+            id(next_look) = now + base + random_uint32() % 2500;
+          }
+          float lx_t = id(look_tx), ly_t = id(look_ty);
+          if (r == 0) { lx_t = 0; ly_t = -8; }
+          if (r == 3) { lx_t = (p < 0.5f) ? -26 : 26; ly_t = 0; }
+          if (r == 4) { lx_t = (p < 0.45f) ? -18 : 18; ly_t = 0; }
+          float sp = (m == 3 || r == 3) ? 0.5f : 0.3f;
+          float dx = (lx_t - s[8]) * sp;
+          s[8] += dx;
+          s[9] += (ly_t - s[9]) * sp;
+          // squash & stretch quando lo sguardo si muove veloce
+          float stretch_t = std::min(0.25f, fabsf(dx) * 0.03f);
+          s[12] += (stretch_t - s[12]) * 0.5f;
+  - interval: 60s
+    then:
+      - script.execute: calcola_umore
+
+# ---------------------------------------------------------------------
+#  Display
+# ---------------------------------------------------------------------
+display:
+  - platform: mipi_spi
+    id: tft
+    model: ST7789V
+    dimensions:
+      width: 240
+      height: 240
+    cs_pin: GPIO15
+    dc_pin: GPIO2
+    spi_mode: MODE3
+    data_rate: 40MHz
+    invert_colors: true
+    color_order: rgb
+    color_depth: 16            # 16 bit: sfumature del bagliore pulite
+    buffer_size: 25%           # 28 KB, disegno a 4 strisce (niente PSRAM)
+    update_interval: 50ms
+    lambda: |-
+      const int W = 240, H = 240, CX = 120;
+      uint32_t now = millis();
+      auto &s = id(st);
+      int m = id(eff_mood);
+      const Color bg = Color(0, 0, 0);
+      it.fill(bg);
+
+      auto mix = [&](float k) {
+        return Color((uint8_t) (s[5] * k), (uint8_t) (s[6] * k), (uint8_t) (s[7] * k));
+      };
+      const Color ec    = mix(1.0f);
+      const Color glow1 = mix(0.10f);
+      const Color glow2 = mix(0.24f);
+      const Color hl = Color((uint8_t) (s[5] + (255 - s[5]) * 0.6f),
+                             (uint8_t) (s[6] + (255 - s[6]) * 0.6f),
+                             (uint8_t) (s[7] + (255 - s[7]) * 0.6f));
+
+      // --- primitive ---
+      auto rrect = [&](int x, int y, int w, int h, int r, Color c) {
+        if (w <= 0 || h <= 0) return;
+        r = std::min(r, std::min(w, h) / 2);
+        if (r < 1) { it.filled_rectangle(x, y, w, h, c); return; }
+        it.filled_rectangle(x + r, y, w - 2 * r, h, c);
+        it.filled_rectangle(x, y + r, w, h - 2 * r, c);
+        it.filled_circle(x + r,         y + r,         r, c);
+        it.filled_circle(x + w - r - 1, y + r,         r, c);
+        it.filled_circle(x + r,         y + h - r - 1, r, c);
+        it.filled_circle(x + w - r - 1, y + h - r - 1, r, c);
+      };
+      auto heart = [&](int x, int y, int sz, Color c) {
+        it.filled_circle(x - sz / 2, y, sz / 2 + 1, c);
+        it.filled_circle(x + sz / 2, y, sz / 2 + 1, c);
+        it.filled_triangle(x - sz - 1, y + 1, x + sz + 1, y + 1, x, y + sz + sz / 2, c);
+      };
+      auto drop = [&](int x, int y, int r, Color c) {
+        it.filled_circle(x, y, r, c);
+        it.filled_triangle(x - r, y - 1, x + r, y - 1, x, y - 2 * r - 2, c);
+      };
+
+      // --- battito ciglia (ogni tanto doppio) ---
+      float blink = 1.0f;
+      uint32_t ph = now % 5300;
+      if (ph < 160) blink = 1.0f - 0.92f * sinf(3.14159f * ph / 160.0f);
+      else if (ph > 380 && ph < 540 && ((now / 5300) % 3) == 0)
+        blink = 1.0f - 0.92f * sinf(3.14159f * (ph - 380) / 160.0f);
+      if (m == 6 || id(react) == 1) blink = 1.0f;
+
+      // --- tremolio e respiro ---
+      float jx = 0, jy = 0;
+      if (m == 3) { jx = sinf(now / 23.0f) * 2.5f; jy = cosf(now / 31.0f) * 1.5f; }
+      if (m == 4) { jx = sinf(now / 14.0f) * 2.0f; }
+      float breath = sinf(now / 900.0f) * 2.0f;
+
+      // --- occhio (sgn: -1 sinistro, +1 destro) ---
+      auto eye = [&](int sgn) {
+        float lx = s[8], ly = s[9];
+        float persp = 1.0f + 0.08f * (lx / 20.0f) * sgn;
+        float sc = (sgn < 0) ? s[10] : s[11];
+        float w = s[0] * persp * (1.0f + s[12] * 0.6f);
+        float h = std::max(4.0f, s[1] * blink * persp * sc * (1.0f - s[12] * 0.5f));
+        float cx = CX + sgn * 56 + lx + jx;
+        float cy = 100 + ly + jy + breath;
+        int x = (int) (cx - w / 2), y = (int) (cy - h / 2);
+        int iw = (int) w, ih = (int) h;
+        int rr = (int) (std::min(w, h) * 0.32f);
+
+        // bagliore a due strati + occhio
+        rrect(x - 9, y - 9, iw + 18, ih + 18, rr + 9, glow1);
+        rrect(x - 4, y - 4, iw + 8,  ih + 8,  rr + 4, glow2);
+        rrect(x, y, iw, ih, rr, ec);
+        // riflesso in alto a sinistra (stessa luce per entrambi gli occhi)
+        if (h > 26) {
+          rrect(x + (int) (w * 0.16f), y + (int) (h * 0.12f),
+                (int) (w * 0.24f), (int) (h * 0.16f), (int) (w * 0.08f), hl);
+        }
+
+        // palpebra superiore: altezza + inclinazione (lato esterno = sgn)
+        float lid = s[2], tilt = s[3];
+        if (lid > 0.02f || fabsf(tilt) > 0.02f) {
+          float base = y + lid * h;
+          int yo = (int) (base + tilt * h * 0.30f);
+          int yi = (int) (base - tilt * h * 0.30f);
+          int xo = (sgn > 0) ? x + iw + 14 : x - 14;
+          int xi = (sgn > 0) ? x - 14 : x + iw + 14;
+          int top = y - 50;
+          it.filled_triangle(xo, top, xi, top, xi, yi, bg);
+          it.filled_triangle(xo, top, xi, yi, xo, yo, bg);
+        }
+        // palpebra inferiore curva: occhi "sorridenti"
+        float b = s[4];
+        if (b > 0.02f) {
+          float R = w * 0.8f + 6;
+          it.filled_circle((int) cx, (int) (y + h - b * h + R), (int) R, bg);
+        }
+      };
+      eye(-1);
+      eye(1);
+
+      // --- dettagli per umore ---
+      switch (m) {
+        case 2: {  // lacrima
+          uint32_t t = now % 3200;
+          if (t < 1800) drop(CX - 44, 136 + t / 22, 4, Color(80, 160, 255));
+          break;
+        }
+        case 4:    // neve
+          for (int i = 0; i < 9; i++) {
+            int fx = (i * 53 + now / 45) % W;
+            int fy = (i * 37 + now / 22) % H;
+            it.filled_circle(fx, fy, 2, Color(200, 230, 255));
+          }
+          break;
+        case 5:    // goccia di sudore
+          drop(CX + 100, 52 + (now / 60) % 30, 6, Color(80, 170, 255));
+          break;
+        case 6:    // Zz (non durante il risveglio)
+          if (id(react) != 4) {
+            int zy = 60 - (int) ((now / 110) % 30);
+            it.print(CX + 70, zy, id(font_zz), Color(0, 90, 120), "z");
+            it.print(CX + 88, zy - 18, id(font_zz), Color(0, 70, 95), "Z");
+          }
+          break;
+        case 7: {  // cuoricini
+          uint32_t t = now % 1600;
+          int hy = 60 - (int) (t / 40);
+          heart(CX - 96, hy + 20, 9, Color(255, 110, 190));
+          heart(CX + 96, hy, 7, Color(255, 150, 210));
+          break;
+        }
+        default: break;
+      }
+
+      // --- barra info discreta ---
+      const Color dim = Color(90, 90, 100);
+      if (id(temp_ext).has_state() && !isnan(id(temp_ext).state)) {
+        it.printf(10, H - 8, id(font_info), dim, TextAlign::BOTTOM_LEFT,
+                  "%.1f°C", id(temp_ext).state);
+      }
+      if (id(meteo).has_state()) {
+        const std::string &w = id(meteo).state;
+        const char *lbl = w.c_str();
+        static const char *const MAP[][2] = {
+          {"sunny", "sole"}, {"clear-night", "sereno"}, {"partlycloudy", "variabile"},
+          {"cloudy", "nuvoloso"}, {"fog", "nebbia"}, {"rainy", "pioggia"},
+          {"pouring", "acquazzone"}, {"lightning", "fulmini"},
+          {"lightning-rainy", "temporale"}, {"snowy", "neve"},
+          {"snowy-rainy", "nevischio"}, {"hail", "grandine"}, {"windy", "vento"},
+          {"windy-variant", "vento forte"}, {"exceptional", "eccezionale"}};
+        for (auto &pr : MAP) if (w == pr[0]) { lbl = pr[1]; break; }
+        it.printf(W - 10, H - 8, id(font_info), dim, TextAlign::BOTTOM_RIGHT, "%s", lbl);
+      }
+
+# ---------------------------------------------------------------------
+#  NOTE - trovare il pin del tasto touch
+#  Se GPIO4 non reagisce: commenta il binary_sensor sopra, scommenta questo
+#  blocco, flasha, tocca il tetto e guarda nel log quale si accende.
+# ---------------------------------------------------------------------
+# binary_sensor:
+#   - { platform: gpio, name: "probe 4",  pin: GPIO4 }
+#   - { platform: gpio, name: "probe 5",  pin: GPIO5 }
+#   - { platform: gpio, name: "probe 18", pin: GPIO18 }
+#   - { platform: gpio, name: "probe 22", pin: GPIO22 }
+#   - { platform: gpio, name: "probe 23", pin: GPIO23 }
+#   - { platform: gpio, name: "probe 25", pin: GPIO25 }
+#   - { platform: gpio, name: "probe 26", pin: GPIO26 }
+#   - { platform: gpio, name: "probe 27", pin: GPIO27 }
+#   - { platform: gpio, name: "probe 32", pin: GPIO32 }
+#   - { platform: gpio, name: "probe 33", pin: GPIO33 }
+#   - { platform: gpio, name: "probe 34", pin: GPIO34 }
+#   - { platform: gpio, name: "probe 35", pin: GPIO35 }
+#   - { platform: gpio, name: "probe 36", pin: GPIO36 }
+#   - { platform: gpio, name: "probe 39", pin: GPIO39 }

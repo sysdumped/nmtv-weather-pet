@@ -1,0 +1,595 @@
+# =====================================================================
+#  NM-TV-154 Desktop Pet - ESPHome - stile "blocco voxel" pixel art
+#  Hardware: NMMiner NM-TV-154 (ESP32-D0WD-V3, ST7789 240x240 SPI)
+#  Un cubo-pet con faccia in pixel: il materiale del blocco cambia con
+#  l'umore (dissolvenza a tessere), il cielo dietro segue il meteo reale.
+# =====================================================================
+
+substitutions:
+  weather_entity: weather.home
+  temp_entity: sensor.outdoor_temperature
+  touch_pin: GPIO4            # da verificare (vedi note in fondo)
+
+esphome:
+  name: nmtv-pet
+  friendly_name: NM-TV Pet
+  on_boot:
+    - priority: 800
+      then:
+        - switch.turn_on: lcd_power
+    - priority: -100
+      then:
+        - script.execute: calcola_umore
+
+esp32:
+  board: esp32dev
+  flash_size: 4MB
+  framework:
+    type: esp-idf
+
+logger:
+
+api:
+  encryption:
+    key: !secret pet_api_key
+  # Azione HA: esphome.nmtv_pet_reazione
+  # tipo: sorpresa | sbadiglio | occhiolino | sospettoso | risveglio
+  actions:
+    - action: reazione
+      variables:
+        tipo: string
+      then:
+        - lambda: |-
+            static const char *const N[] = {"sorpresa", "sbadiglio", "occhiolino",
+                                            "sospettoso", "risveglio"};
+            for (int i = 0; i < 5; i++) {
+              if (tipo == N[i]) {
+                id(react) = i;
+                id(react_start) = millis();
+                id(react_until) = 0;
+              }
+            }
+
+ota:
+  - platform: esphome
+    password: !secret pet_ota_password
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+# ---------------------------------------------------------------------
+#  Stato interno
+# ---------------------------------------------------------------------
+globals:
+  # 0 felice | 1 annoiato | 2 triste | 3 spaventato
+  # 4 infreddolito | 5 accaldato | 6 assonnato | 7 coccolato
+  - id: mood
+    type: int
+    initial_value: '1'
+  - id: eff_mood
+    type: int
+    initial_value: '1'
+  - id: petted_until
+    type: uint32_t
+    initial_value: '0'
+  - id: look                 # sguardo a scatti: -1 / 0 / +1 pixel
+    type: int
+    initial_value: '0'
+  - id: next_look
+    type: uint32_t
+    initial_value: '0'
+  - id: mat_cur              # materiale del blocco (= umore) e transizione
+    type: int
+    initial_value: '1'
+  - id: mat_prev
+    type: int
+    initial_value: '1'
+  - id: mat_t0
+    type: uint32_t
+    initial_value: '0'
+  # Reazioni: -1 nessuna | 0 sorpresa | 1 sbadiglio | 2 occhiolino
+  #           3 sospettoso | 4 risveglio
+  - id: react
+    type: int
+    initial_value: '-1'
+  - id: react_start
+    type: uint32_t
+    initial_value: '0'
+  - id: react_until
+    type: uint32_t
+    initial_value: '0'
+  - id: next_react
+    type: uint32_t
+    initial_value: '20000'
+  - id: last_meteo
+    type: std::string
+    initial_value: '""'
+
+# ---------------------------------------------------------------------
+#  Dati da Home Assistant
+# ---------------------------------------------------------------------
+text_sensor:
+  - platform: homeassistant
+    id: meteo
+    entity_id: ${weather_entity}
+    on_value:
+      - lambda: |-
+          if (!id(last_meteo).empty() && id(last_meteo) != x && id(eff_mood) != 6) {
+            id(react) = 0;
+            id(react_start) = millis();
+            id(react_until) = 0;
+          }
+          id(last_meteo) = x;
+      - script.execute: calcola_umore
+
+sensor:
+  - platform: homeassistant
+    id: temp_ext
+    entity_id: ${temp_entity}
+    on_value:
+      - script.execute: calcola_umore
+
+script:
+  - id: calcola_umore
+    then:
+      - lambda: |-
+          std::string w = id(meteo).has_state() ? id(meteo).state : "";
+          float t = id(temp_ext).state;
+          int m = 1;
+          if (w == "sunny" || w == "partlycloudy")                       m = 0;
+          else if (w == "clear-night")                                   m = 6;
+          else if (w == "rainy" || w == "pouring")                       m = 2;
+          else if (w == "lightning" || w == "lightning-rainy" ||
+                   w == "exceptional" || w == "windy-variant")           m = 3;
+          else if (w == "snowy" || w == "snowy-rainy" || w == "hail")    m = 4;
+          else                                                           m = 1;
+          if (!isnan(t)) {
+            if (t <= 3.0f)  m = 4;
+            if (t >= 30.0f) m = 5;
+          }
+          id(mood) = m;
+
+select:
+  - platform: template
+    id: mood_override
+    name: "Umore"
+    optimistic: true
+    initial_option: "Auto"
+    options:
+      - "Auto"
+      - "Felice"
+      - "Annoiato"
+      - "Triste"
+      - "Spaventato"
+      - "Infreddolito"
+      - "Accaldato"
+      - "Assonnato"
+      - "Coccolato"
+
+# ---------------------------------------------------------------------
+#  Hardware
+# ---------------------------------------------------------------------
+switch:
+  - platform: gpio
+    id: lcd_power
+    pin: GPIO21
+    inverted: true
+    restore_mode: ALWAYS_ON
+    internal: true
+
+binary_sensor:
+  - platform: gpio
+    id: btn_touch
+    name: "Coccola"
+    pin:
+      number: ${touch_pin}
+      inverted: false
+    filters:
+      - delayed_on: 30ms
+    on_press:
+      - lambda: |-
+          id(petted_until) = millis() + 5000;
+
+output:
+  - platform: ledc
+    id: bl_pwm
+    pin: GPIO19
+    inverted: true
+    frequency: 2000
+
+light:
+  - platform: monochromatic
+    output: bl_pwm
+    name: Retroilluminazione
+    restore_mode: ALWAYS_ON
+    default_transition_length: 0s
+
+spi:
+  clk_pin: GPIO14
+  mosi_pin: GPIO13
+
+font:
+  - file: "gfonts://VT323"
+    id: font_px
+    size: 22
+
+# ---------------------------------------------------------------------
+#  Logica: umore effettivo, reazioni, sguardo, cambio materiale
+# ---------------------------------------------------------------------
+interval:
+  - interval: 100ms
+    then:
+      - lambda: |-
+          uint32_t now = millis();
+          int m = id(mood);
+          auto idx = id(mood_override).active_index();
+          if (idx.has_value() && *idx > 0) m = (int) *idx - 1;
+          bool petted = now < id(petted_until);
+          if (petted) m = 7;
+          id(eff_mood) = m;
+
+          if (m != id(mat_cur)) {
+            id(mat_prev) = id(mat_cur);
+            id(mat_cur) = m;
+            id(mat_t0) = now;
+          }
+
+          static const uint32_t DUR[5] = {1500, 2400, 1000, 2800, 2400};
+          int r = id(react);
+          if (petted && r >= 0) { r = -1; id(react) = -1; }
+          if (r >= 0 && id(react_until) == 0) id(react_until) = id(react_start) + DUR[r];
+          if (r >= 0 && now > id(react_until)) {
+            r = -1;
+            id(react) = -1;
+            id(next_react) = now + 25000 + random_uint32() % 45000;
+          }
+          if (r < 0 && now > id(next_react) && !petted) {
+            int pick = -1;
+            bool coin = random_uint32() % 2;
+            switch (m) {
+              case 0: pick = coin ? 2 : 3; break;
+              case 1: pick = coin ? 1 : 3; break;
+              case 2: case 4: pick = 3; break;
+              case 5: pick = 1; break;
+              case 6: pick = 4; break;
+              default: break;
+            }
+            if (pick >= 0) {
+              id(react) = pick;
+              id(react_start) = now;
+              id(react_until) = now + DUR[pick];
+            } else {
+              id(next_react) = now + 30000;
+            }
+          }
+
+          if (now > id(next_look)) {
+            int choice = (int) (random_uint32() % 3) - 1;
+            if (m == 6 || m == 7) choice = 0;
+            id(look) = choice;
+            uint32_t base = (m == 3) ? 400 : (m == 1 ? 2500 : 1500);
+            id(next_look) = now + base + random_uint32() % 2500;
+          }
+  - interval: 60s
+    then:
+      - script.execute: calcola_umore
+
+# ---------------------------------------------------------------------
+#  Display
+# ---------------------------------------------------------------------
+display:
+  - platform: mipi_spi
+    id: tft
+    model: ST7789V
+    dimensions:
+      width: 240
+      height: 240
+    cs_pin: GPIO15
+    dc_pin: GPIO2
+    spi_mode: MODE3
+    data_rate: 40MHz
+    invert_colors: true
+    color_order: rgb
+    color_depth: 16
+    buffer_size: 25%
+    update_interval: 80ms
+    lambda: |-
+      const int H = 240, FY = 200;           // FY = linea del pavimento
+      uint32_t now = millis();
+      int m = id(eff_mood);
+      int r = id(react);
+      static const uint32_t DUR[5] = {1500, 2400, 1000, 2800, 2400};
+      float p = 0;
+      if (r >= 0) p = std::min(1.0f, (now - id(react_start)) / (float) DUR[r]);
+      const std::string w = id(meteo).has_state() ? id(meteo).state : "";
+
+      // ---------- utilità ----------
+      auto hsh = [](int a, int b, int c) -> uint32_t {
+        uint32_t h = (uint32_t) a * 73856093u ^ (uint32_t) b * 19349663u ^ (uint32_t) c * 83492791u;
+        h ^= h >> 13; h *= 0x5bd1e995u; h ^= h >> 15;
+        return h;
+      };
+      auto shade = [](const uint8_t *b, float f) -> Color {
+        auto cl = [](float v) -> uint8_t { return v < 0 ? 0 : (v > 255 ? 255 : (uint8_t) v); };
+        return Color(cl(b[0] * f), cl(b[1] * f), cl(b[2] * f));
+      };
+      auto glyph = [&](int x, int y, int px, const char *const *rows, int nrows, Color col) {
+        for (int rr = 0; rr < nrows; rr++)
+          for (int c = 0; rows[rr][c]; c++)
+            if (rows[rr][c] == 'X') it.filled_rectangle(x + c * px, y + rr * px, px, px, col);
+      };
+      static const char *const HEART[] = {".X.X.", "XXXXX", ".XXX.", "..X.."};
+      static const char *const ZED[]   = {"XXXX", "..X.", ".X..", "XXXX"};
+      static const char *const BANG[]  = {"X", "X", "X", ".", "X"};
+
+      // materiali del blocco, uno per umore
+      static const uint8_t MAT[8][3] = {
+        {235, 185,  70},   // felice: miele
+        {135, 138, 148},   // annoiato: pietra
+        { 85, 110, 170},   // triste: ardesia blu
+        {150, 100, 205},   // spaventato: ametista
+        {165, 215, 245},   // infreddolito: ghiaccio
+        {210, 105,  60},   // accaldato: terracotta
+        { 75,  85, 120},   // assonnato: notte
+        {240, 140, 185},   // coccolato: rosa
+      };
+      static const float TEX[6] = {1.0f, 0.92f, 1.07f, 0.86f, 1.0f, 0.96f};
+      float prog = std::min(1.0f, (now - id(mat_t0)) / 700.0f);
+      auto matFor = [&](int a, int b, int c) -> const uint8_t * {
+        return MAT[(hsh(a, b, c + 7) % 1000) < (uint32_t) (prog * 1000) ? id(mat_cur) : id(mat_prev)];
+      };
+
+      // ---------- cielo dal meteo reale ----------
+      bool sunny  = (w == "sunny" || w == "partlycloudy");
+      bool night  = (w == "clear-night");
+      bool storm  = (w == "lightning" || w == "lightning-rainy");
+      bool rain   = (w == "rainy" || w == "pouring" || w == "lightning-rainy" || w == "snowy-rainy");
+      bool snow   = (w == "snowy" || w == "snowy-rainy" || w == "hail");
+      bool cloudy = (w == "cloudy" || w == "partlycloudy" || rain || storm || snow ||
+                     w == "windy" || w == "windy-variant");
+      bool dark   = night || rain || storm || w == "exceptional";
+      Color sky;
+      if (sunny || w.empty())   sky = Color(110, 175, 245);
+      else if (night)           sky = Color(12, 16, 40);
+      else if (dark)            sky = Color(70, 85, 110);
+      else if (snow)            sky = Color(160, 180, 205);
+      else                      sky = Color(130, 150, 175);
+      if (storm && (now % 6800) < 110) sky = Color(235, 235, 255);   // lampo
+      it.fill(sky);
+
+      if (sunny) {
+        it.filled_rectangle(12, 10, 28, 28, Color(255, 210, 60));
+        it.filled_rectangle(18, 16, 16, 16, Color(255, 240, 150));
+      }
+      if (night) {
+        for (int i = 0; i < 16; i++) {
+          if (((now / 400) + i) % 7 == 0) continue;                 // scintillio
+          uint32_t hh = hsh(i, 3, 99);
+          it.filled_rectangle((hh % 58) * 4, ((hh >> 8) % 12) * 4 + 4, 2, 2, Color(230, 230, 255));
+        }
+        it.filled_rectangle(14, 10, 24, 24, Color(225, 225, 235));
+        it.filled_rectangle(20, 16, 6, 6, Color(185, 185, 200));
+        it.filled_rectangle(28, 26, 4, 4, Color(185, 185, 200));
+      }
+      if (cloudy) {
+        Color cc = dark ? Color(110, 120, 140) : Color(235, 240, 248);
+        auto cloud = [&](int x, int y) {
+          it.filled_rectangle(x, y + 8, 48, 12, cc);
+          it.filled_rectangle(x + 8, y, 20, 8, cc);
+          it.filled_rectangle(x + 24, y + 4, 16, 4, cc);
+        };
+        cloud((int) ((now / 90) % 320) - 60, 6);
+        cloud((int) ((now / 130 + 170) % 320) - 60, 24);
+      }
+      if (w == "fog") {
+        for (int i = 0; i < 4; i++)
+          it.filled_rectangle((int) ((now / 60 + i * 90) % 360) - 120, 40 + i * 40, 120, 6,
+                              Color(190, 195, 205));
+      }
+      if (rain) {
+        int n = (w == "pouring") ? 22 : 13;
+        for (int i = 0; i < n; i++) {
+          int x = (int) (hsh(i, 1, 5) % 60) * 4;
+          int y = (int) ((now / 5 + hsh(i, 2, 5) % 260) % 260) - 20;
+          it.filled_rectangle(x, y, 2, 8, Color(120, 170, 245));
+        }
+      }
+      if (snow) {
+        for (int i = 0; i < 14; i++) {
+          int x = ((int) (hsh(i, 1, 9) % 60) * 4 + (int) ((now / 300 + i) % 3) * 2) % 240;
+          int y = (int) ((now / 25 + hsh(i, 2, 9) % 250) % 250) - 10;
+          it.filled_rectangle(x, y, 4, 4, Color(245, 248, 255));
+        }
+      }
+
+      // ---------- pavimento a tessere ----------
+      static const uint8_t FLOOR[3] = {78, 80, 88};
+      for (int c = 0; c < 24; c++)
+        for (int rr = 0; rr < 4; rr++)
+          it.filled_rectangle(c * 10, FY + rr * 10, 10, 10,
+                              shade(FLOOR, TEX[hsh(c, rr, 3) % 6] * (rr == 0 ? 1.15f : 1.0f)));
+
+      // ---------- posizione del blocco (saltelli quantizzati) ----------
+      int bx = 40, by = 50;
+      int bob = ((now / 650) % 2) ? 0 : -2;
+      if (m == 0) { uint32_t ph = now % 1600; if (ph < 320) bob = -(int) (sinf(3.14159f * ph / 320.0f) * 10) & ~1; }
+      if (m == 7) { uint32_t ph = now % 600;  bob = -(int) (sinf(3.14159f * ph / 600.0f) * 12) & ~1; }
+      if (m == 6) bob = ((now / 1500) % 2) ? 0 : -1;
+      if (r == 0 && p < 0.25f) bob = -(int) (sinf(3.14159f * p / 0.25f) * 14) & ~1;
+      int shx = 0;
+      if (m == 3) shx = ((now / 50) % 2) ? 2 : -2;
+      if (m == 4) shx = ((now / 80) % 2) ? 1 : -1;
+      bx += shx;
+      by += bob;
+
+      // ombra
+      int sw = 150 + bob * 2;
+      it.filled_rectangle(bx + 5 + (150 - sw) / 2, FY, sw, 5, Color(45, 45, 52));
+
+      // ---------- cubo: faccia superiore, lato, fronte ----------
+      for (int k = 0; k < 4; k++)
+        for (int c = 0; c < 14; c++)
+          it.filled_rectangle(bx + 5 * (k + 1) + c * 10, by - 5 * (k + 1), 10, 5,
+                              shade(matFor(c, k, 1), 1.22f * TEX[hsh(c, k, 11) % 6]));
+      for (int k = 0; k < 4; k++)
+        for (int rr = 0; rr < 14; rr++)
+          it.filled_rectangle(bx + 140 + 5 * k, by - 5 * k + rr * 10, 5, 10,
+                              shade(matFor(k, rr, 2), 0.62f * TEX[hsh(k, rr, 13) % 6]));
+      for (int rr = 0; rr < 14; rr++)
+        for (int c = 0; c < 14; c++)
+          it.filled_rectangle(bx + c * 10, by + rr * 10, 10, 10,
+                              shade(matFor(c, rr, 0), TEX[hsh(c, rr, 17) % 6]));
+
+      // ---------- faccia in pixel (griglia 14x14 sul fronte) ----------
+      const Color ink   = shade(MAT[id(mat_cur)], 0.22f);
+      const Color WHITE = Color(255, 255, 255);
+      const Color PINK  = Color(230, 80, 110);
+      auto UN = [&](int c, int rr, Color col) {
+        it.filled_rectangle(bx + c * 10, by + rr * 10, 10, 10, col);
+      };
+
+      int lo = id(look);
+      if (r == 3) lo = (p < 0.5f) ? -1 : 1;
+      if (r == 4) lo = (p < 0.45f) ? -1 : 1;
+      if (r == 0) lo = 0;
+
+      // tipi occhio: 0 normale | 1 mezzo | 2 chiuso | 3 grande | 4 a "^"
+      auto eyeAt = [&](int c0, int type) {
+        int c = c0 + lo;
+        switch (type) {
+          case 0:
+            UN(c, 5, ink); UN(c + 1, 5, ink); UN(c, 6, ink); UN(c + 1, 6, ink);
+            it.filled_rectangle(bx + c * 10 + 2, by + 52, 4, 4, WHITE);
+            break;
+          case 1:
+            UN(c, 6, ink); UN(c + 1, 6, ink);
+            break;
+          case 2:
+            it.filled_rectangle(bx + c * 10, by + 64, 20, 4, ink);
+            break;
+          case 3:
+            for (int k = 4; k <= 6; k++) { UN(c, k, ink); UN(c + 1, k, ink); }
+            it.filled_rectangle(bx + c * 10 + 2, by + 42, 5, 5, WHITE);
+            break;
+          case 4:
+            UN(c0 - 1, 6, ink); UN(c0, 5, ink); UN(c0 + 1, 5, ink); UN(c0 + 2, 6, ink);
+            break;
+        }
+      };
+
+      // bocche: 0 sorriso | 1 piatta | 2 broncio | 3 "O" | 4 denti che battono
+      //         5 lingua fuori | 6 piccola | 7 sorrisone | 8 sbadiglio
+      int eL = 0, eR = 0, mouth = 0;
+      bool blush = false;
+      switch (m) {
+        case 0: eL = eR = 0; mouth = 0; blush = true; break;
+        case 1: eL = eR = 1; mouth = 1; break;
+        case 2: eL = eR = 0; mouth = 2; break;
+        case 3: eL = eR = 3; mouth = 3; break;
+        case 4: eL = eR = 1; mouth = 4; break;
+        case 5: eL = eR = 1; mouth = 5; break;
+        case 6: eL = eR = 2; mouth = 6; break;
+        default: eL = eR = 4; mouth = 7; blush = true; break;
+      }
+      switch (r) {
+        case 0: eL = eR = 3; mouth = 3; break;
+        case 1: if (p < 0.75f) { eL = eR = 2; mouth = 8; } break;
+        case 2: eR = 2; if (eL == 1 || eL == 2) eL = 0; mouth = 0; break;
+        case 3: eL = eR = 1; mouth = 1; break;
+        case 4: if (p > 0.15f && p < 0.85f) { eL = eR = 1; mouth = 6; } break;
+        default: break;
+      }
+      if ((now % 4700) < 150) {                                     // battito ciglia
+        if (eL == 0 || eL == 3) eL = 2;
+        if (eR == 0 || eR == 3) eR = 2;
+      }
+      eyeAt(3, eL);
+      eyeAt(9, eR);
+
+      if (mouth == 2) { UN(4, 2, ink); UN(3, 3, ink); UN(9, 2, ink); UN(10, 3, ink); }   // sopracciglia tristi
+      if (r == 3) { UN(3, 4, ink); UN(4, 4, ink); UN(9, 4, ink); UN(10, 4, ink); }       // sospettoso
+
+      switch (mouth) {
+        case 0: UN(4, 9, ink); UN(9, 9, ink); for (int c = 5; c <= 8; c++) UN(c, 10, ink); break;
+        case 1: for (int c = 5; c <= 8; c++) UN(c, 10, ink); break;
+        case 2: for (int c = 5; c <= 8; c++) UN(c, 10, ink); UN(4, 11, ink); UN(9, 11, ink); break;
+        case 3: for (int k = 9; k <= 11; k++) { UN(6, k, ink); UN(7, k, ink); } break;
+        case 4: {
+          int f = (now / 120) % 2;
+          for (int c = 4; c <= 9; c++) UN(c, ((c + f) % 2) ? 9 : 10, ink);
+          break;
+        }
+        case 5:
+          for (int c = 5; c <= 8; c++) { UN(c, 9, ink); UN(c, 10, ink); }
+          UN(6, 11, PINK); UN(7, 11, PINK);
+          break;
+        case 6: UN(6, 10, ink); UN(7, 10, ink); break;
+        case 7:
+          for (int c = 4; c <= 9; c++) UN(c, 9, ink);
+          for (int c = 5; c <= 8; c++) UN(c, 10, ink);
+          UN(6, 10, PINK); UN(7, 10, PINK);
+          break;
+        case 8:
+          for (int k = 8; k <= 11; k++) for (int c = 5; c <= 8; c++) UN(c, k, ink);
+          UN(6, 11, PINK); UN(7, 11, PINK);
+          break;
+      }
+      if (blush) { UN(2, 8, Color(255, 130, 150)); UN(11, 8, Color(255, 130, 150)); }
+
+      // ---------- dettagli per umore / reazione ----------
+      if (m == 2 && r < 0) {                                        // lacrima a scatti
+        int tr = 7 + (now / 260) % 6;
+        if (tr <= 11) it.filled_rectangle(bx + (3 + lo) * 10 + 2, by + tr * 10, 6, 10, Color(90, 160, 255));
+      }
+      if (m == 5)                                                   // goccia di sudore
+        it.filled_rectangle(bx + 122, by + 14 + (int) ((now / 90) % 4) * 6, 6, 8, Color(110, 180, 255));
+      if (m == 6 && r != 4) {                                       // zZ
+        int zy = by - 24 - (int) ((now / 140) % 6) * 3;
+        glyph(bx + 158, zy, 4, ZED, 4, Color(200, 210, 255));
+        glyph(bx + 178, std::max(0, zy - 14), 3, ZED, 4, Color(160, 170, 220));
+      }
+      if (m == 7) {                                                 // cuoricini
+        int hy = by - 10 - (int) ((now / 80) % 8) * 4;
+        glyph(bx - 34, hy + 10, 4, HEART, 4, Color(255, 90, 150));
+        glyph(bx + 166, hy - 6, 3, HEART, 4, Color(255, 140, 190));
+      }
+      if (r == 0) glyph(bx + 166, by - 40, 5, BANG, 5, Color(255, 225, 60));   // "!"
+
+      // ---------- info sul pavimento ----------
+      const Color txt = Color(225, 225, 232);
+      if (id(temp_ext).has_state() && !isnan(id(temp_ext).state)) {
+        it.printf(8, H - 4, id(font_px), txt, TextAlign::BOTTOM_LEFT, "%.1f°C", id(temp_ext).state);
+      }
+      if (!w.empty()) {
+        const char *lbl = w.c_str();
+        static const char *const MAP[][2] = {
+          {"sunny", "sole"}, {"clear-night", "sereno"}, {"partlycloudy", "variabile"},
+          {"cloudy", "nuvoloso"}, {"fog", "nebbia"}, {"rainy", "pioggia"},
+          {"pouring", "acquazzone"}, {"lightning", "fulmini"},
+          {"lightning-rainy", "temporale"}, {"snowy", "neve"},
+          {"snowy-rainy", "nevischio"}, {"hail", "grandine"}, {"windy", "vento"},
+          {"windy-variant", "vento forte"}, {"exceptional", "eccezionale"}};
+        for (auto &pr : MAP) if (w == pr[0]) { lbl = pr[1]; break; }
+        it.printf(232, H - 4, id(font_px), txt, TextAlign::BOTTOM_RIGHT, "%s", lbl);
+      }
+
+# ---------------------------------------------------------------------
+#  NOTE - trovare il pin del tasto touch
+#  Se GPIO4 non reagisce: commenta il binary_sensor sopra, scommenta questo
+#  blocco, flasha, tocca il tetto e guarda nel log quale si accende.
+# ---------------------------------------------------------------------
+# binary_sensor:
+#   - { platform: gpio, name: "probe 4",  pin: GPIO4 }
+#   - { platform: gpio, name: "probe 5",  pin: GPIO5 }
+#   - { platform: gpio, name: "probe 18", pin: GPIO18 }
+#   - { platform: gpio, name: "probe 22", pin: GPIO22 }
+#   - { platform: gpio, name: "probe 23", pin: GPIO23 }
+#   - { platform: gpio, name: "probe 25", pin: GPIO25 }
+#   - { platform: gpio, name: "probe 26", pin: GPIO26 }
+#   - { platform: gpio, name: "probe 27", pin: GPIO27 }
+#   - { platform: gpio, name: "probe 32", pin: GPIO32 }
+#   - { platform: gpio, name: "probe 33", pin: GPIO33 }
+#   - { platform: gpio, name: "probe 34", pin: GPIO34 }
+#   - { platform: gpio, name: "probe 35", pin: GPIO35 }
+#   - { platform: gpio, name: "probe 36", pin: GPIO36 }
+#   - { platform: gpio, name: "probe 39", pin: GPIO39 }
