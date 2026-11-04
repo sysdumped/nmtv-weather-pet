@@ -8,7 +8,8 @@
 substitutions:
   weather_entity: weather.home
   temp_entity: sensor.outdoor_temperature
-  touch_pin: GPIO4            # da verificare (vedi note in fondo)
+  touch_pin: GPIO32           # pad touch capacitivo sul tetto (T9)
+  touch_threshold: "1490"     # a riposo ~1640, col dito ~1330: scatta sotto soglia
 
 esphome:
   name: nmtv-pet
@@ -177,15 +178,21 @@ switch:
     restore_mode: ALWAYS_ON
     internal: true
 
+# Il tasto sul tetto è un pad capacitivo collegato direttamente all'ESP32.
+# Per ricalibrare: setup_mode: true, guarda i valori nel log con e senza dito
+# e metti touch_threshold a metà strada.
+esp32_touch:
+  setup_mode: false
+
 binary_sensor:
-  - platform: gpio
+  - platform: esp32_touch
     id: btn_touch
     name: "Coccola"
-    pin:
-      number: ${touch_pin}
-      inverted: false
+    pin: ${touch_pin}
+    threshold: ${touch_threshold}
     filters:
       - delayed_on: 30ms
+      - delayed_off: 50ms
     on_press:
       - lambda: |-
           id(petted_until) = millis() + 5000;
@@ -572,24 +579,3 @@ display:
         for (auto &pr : MAP) if (w == pr[0]) { lbl = pr[1]; break; }
         it.printf(232, H - 4, id(font_px), txt, TextAlign::BOTTOM_RIGHT, "%s", lbl);
       }
-
-# ---------------------------------------------------------------------
-#  NOTE - trovare il pin del tasto touch
-#  Se GPIO4 non reagisce: commenta il binary_sensor sopra, scommenta questo
-#  blocco, flasha, tocca il tetto e guarda nel log quale si accende.
-# ---------------------------------------------------------------------
-# binary_sensor:
-#   - { platform: gpio, name: "probe 4",  pin: GPIO4 }
-#   - { platform: gpio, name: "probe 5",  pin: GPIO5 }
-#   - { platform: gpio, name: "probe 18", pin: GPIO18 }
-#   - { platform: gpio, name: "probe 22", pin: GPIO22 }
-#   - { platform: gpio, name: "probe 23", pin: GPIO23 }
-#   - { platform: gpio, name: "probe 25", pin: GPIO25 }
-#   - { platform: gpio, name: "probe 26", pin: GPIO26 }
-#   - { platform: gpio, name: "probe 27", pin: GPIO27 }
-#   - { platform: gpio, name: "probe 32", pin: GPIO32 }
-#   - { platform: gpio, name: "probe 33", pin: GPIO33 }
-#   - { platform: gpio, name: "probe 34", pin: GPIO34 }
-#   - { platform: gpio, name: "probe 35", pin: GPIO35 }
-#   - { platform: gpio, name: "probe 36", pin: GPIO36 }
-#   - { platform: gpio, name: "probe 39", pin: GPIO39 }

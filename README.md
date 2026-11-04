@@ -52,7 +52,7 @@ In [`styles/voxel.yaml`](styles/voxel.yaml) c'è una variante in pixel art: un c
 | LCD CS / DC / RST | 15 / 2 / — |
 | Retroilluminazione (PWM, attiva LOW) | 19 |
 | Alimentazione pannello (attiva LOW) | 21 |
-| Tasto touch sul tetto | **da verificare** (default 4) |
+| Tasto touch sul tetto (pad capacitivo T9) | 32 |
 
 Il pannello richiede **SPI mode 3**: con mode 0 resta nero. Il buffer è a 16 bit al 25% (circa 28 KB, disegno a 4 strisce) perché la scheda non ha PSRAM.
 
@@ -69,9 +69,9 @@ Il pannello richiede **SPI mode 3**: con mode 0 resta nero. Il buffer è a 16 bi
 4. Primo flash via USB, poi aggiornamenti OTA.
 5. In HA vai in *Impostazioni → Dispositivi e servizi* e **aggiungi il dispositivo all'integrazione ESPHome** con la stessa chiave. Senza questo passaggio i dati del meteo non arrivano (vedere il dispositivo in ESPHome Builder non basta).
 
-### Trovare il pin del tasto touch
+### Tasto touch sul tetto
 
-Il pin del tasto sul tetto non è documentato. Se GPIO4 non reagisce, in fondo al YAML c'è un blocco commentato che legge tutti i GPIO candidati: attivalo, tocca il tetto e guarda nel log quale cambia stato.
+Il tasto è un **pad capacitivo** collegato direttamente all'ESP32 (GPIO32, canale T9), non un pulsante digitale: per questo si usa il componente `esp32_touch`. Sul mio cubo il valore grezzo è circa 1640 a riposo e circa 1330 col dito; la soglia di default è 1490. Se sul tuo non reagisce, o scatta da solo, metti `setup_mode: true` in `esp32_touch`, guarda i valori nel log con e senza dito e imposta `touch_threshold` a metà strada.
 
 ## Progetto gemello
 
